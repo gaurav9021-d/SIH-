@@ -1,0 +1,8 @@
+- Ingestion: Python (requests, httpx, tenacity for exponential backoff)
+- Storage & GIS Engine: PostgreSQL 15 or newer + PostGIS 3.3 or newer (Dockerized locally on 15 + 3.3; managed Postgres such as Supabase currently serves 17 + 3.3.7)
+- Partitioning & Matrix Acceleration: Uber H3 (spatial indexing) and DuckDB (cold-data backfill queries)
+- Clustering: In-database PostGIS ST_ClusterDBSCAN with temporal windowing (or scikit-learn ST-DBSCAN)
+- Weather/Atmospheric Drivers: NCMRWF (Regional India) with automatic fallback to NOAA GFS (Global 0.25°)
+- ML Engine: XGBoost (multiclass multi:softprob) with scikit-learn CalibratedClassifierCV
+- API Backend: FastAPI + SQLAlchemy (connection pooling enabled)
+- Frontend: React + Leaflet / Mapbox GL

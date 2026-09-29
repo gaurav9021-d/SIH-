@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sih26162-ingestion"
+version = "0.1.0"
+description = "Resilient satellite-data ingestion for SIH26162"
+readme = "ingestion/README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "alembic==1.20.0",
+  "h3==4.5.0",
+  "httpx==0.28.1",
+  "numpy==2.4.3",
+  "psycopg[binary]==3.3.6",
+  "pydantic-settings==2.15.0",
+  "PyYAML==6.0.3",
+  "SQLAlchemy==2.0.49",
+  "tenacity==9.1.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "geographiclib==2.1",
+  "hypothesis==6.168.3",
+  "pytest==9.1.1",
+]
+
+[project.scripts]
+sih-ingest = "ingestion.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["ingestion*", "clustering*"]
+
+[tool.setuptools.package-data]
+ingestion = ["config/*.yaml", "migrations/*.mako"]
+clustering = ["config/*.yaml", "migrations/*.mako"]
+
+[tool.pytest.ini_options]
+testpaths = ["clustering/tests"]
+filterwarnings = ["error::DeprecationWarning"]

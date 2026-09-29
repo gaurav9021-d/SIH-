@@ -1,0 +1,74 @@
+aois:
+  india: [68.0, 6.5, 97.5, 37.5]
+default_aoi: india
+
+params:
+  eps_m: 750.0
+  min_samples: 2
+  inactivity_days: 7.0
+  max_linkage_gap_days: 7.0
+  max_cluster_diameter_m: 2000.0
+  reconcile_spatial_m: 375.0
+  reconcile_temporal_minutes: 15.0
+  reconcile_enabled: true
+  h3_resolution: 6
+  h3_ring: 1
+
+runtime:
+  batch_size: 20000
+  flush_every: 5000
+
+database:
+  pool_size: 2
+  max_overflow: 1
+  pool_timeout_s: 30.0
+  pool_recycle_s: 1800
+  batch_size: 5000
+  operation_max_attempts: 4
+  connection_budget: 40
+
+stress:
+  scenarios:
+    - name: india_stubble_nov2025
+      description: Dense multi-event stubble burning in Punjab, Haryana and western UP.
+      source: store
+      aoi: india
+      start: 2025-11-01
+      end: 2025-11-20
+      expect:
+        max_extent_m: 2000.0
+        max_observations_per_cluster: 400
+        min_clusters: 50
+        max_mean_observations_per_cluster: 40.0
+    - name: india_sparse_sep8_2026
+      description: Late-monsoon Indian sparsity; isolated detections must not merge.
+      source: store
+      aoi: india
+      start: 2026-09-08
+      end: 2026-09-08
+      expect:
+        max_extent_m: 2000.0
+        max_observations_per_cluster: 100
+        report_noise_fraction: true
+    - name: savanna_dense_sep8_2026
+      description: >
+        Synthetic high-density savanna burning. Deterministic fixture, not
+        observed data; proves the extent guard without expanding ingestion.
+      source: fixture
+      fixture: dense_savanna_grid
+      start: 2026-09-08
+      end: 2026-09-08
+      expect:
+        max_extent_m: 2000.0
+        min_clusters: 100
+    - name: chain_runaway_guard
+      description: >
+        Detections 700 m apart along a 20 km line. Textbook DBSCAN returns one
+        cluster about 20 km across; the guard must split it.
+      source: fixture
+      fixture: linear_chain_20km
+      start: 2026-09-08
+      end: 2026-09-08
+      expect:
+        max_extent_m: 2000.0
+        min_clusters: 10

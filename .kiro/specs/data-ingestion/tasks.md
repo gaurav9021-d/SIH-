@@ -1,0 +1,448 @@
+# Implementation Plan: Data Ingestion
+
+This plan implements the approved requirements and design under `/ingestion/`. Complete tasks in order; later source adapters depend on the shared infrastructure established first. The plan deliberately excludes clustering, feature engineering, model training, the API and the dashboard.
+
+Automated test creation is not included because it was not requested. Each phase includes executable validation checkpoints against the acceptance criteria; automated tests can be added as a separate task if requested.
+
+- [ ] 1. Bootstrap the ingestion project and local runtime
+  - [ ] 1.1 Create the Python package and module layout from `design.md`
+    - Add `ingestion/__main__.py`, `runner.py`, `core/`, and one package for each source.
+    - Add placeholder CLI subcommands: `runner`, `run`, `backfill`, `migrate`, and `check`.
+    - Ensure `python -m ingestion --help` works on Windows and Linux.
+    - _Requirements: 1.1, 7.3_
+  - [ ] 1.2 Define and pin the Python environment
+    - Add exact dependency versions to `pyproject.toml` for httpx, tenacity, SQLAlchemy, psycopg, Alembic, pydantic-settings, PyYAML, APScheduler, python-json-logger, pyrosm, shapely, numpy, xarray, netCDF4, cfgrib, rasterio and supporting packages.
+    - Add `environment.yml` for the Windows conda-forge development environment.
+    - Add an ingestion Dockerfile as the reference Linux runtime.
+    - _Requirements: 1.1, 10.1, 11.2, 13.6, 14.1_
+  - [ ] 1.3 Add secure environment and configuration files
+    - Add `.env.example` containing placeholder values for every secret from the design.
+    - Add `.env`, temporary downloads, GRIB, netCDF and PBF files to `.gitignore`.
+    - Add `ingestion/config/ingestion.yaml` with the India default AOI `[68.0, 6.5, 97.5, 37.5]`, schedules, timeouts, retry limits, pool limits, source products and source endpoints.
+    - Implement environment overrides with the `INGEST__...` nested-key convention.
+    - _Requirements: 3.1, 3.2, 3.3, 3.6, 3.7_
+  - [ ] 1.4 Add PostGIS development infrastructure
+    - Create `/docker/docker-compose.yml` for PostgreSQL 15 + PostGIS 3.3, with credentials read from `.env`, a named volume and a localhost-only port binding.
+    - Add an optional compose profile for the ingestion runner.
+    - Add container health checks and make the ingestion profile wait for a healthy database.
+    - _Requirements: 4.1, 5.1, 5.8_
+  - [ ] 1.5 Validate the project foundation
+    - Start PostGIS and confirm its health check passes.
+    - Confirm `python -m ingestion --help` and `python -m ingestion check` execute without import errors.
+    - Inspect tracked files and confirm `.env` and downloaded source files are excluded.
+    - _Requirements: 1.1, 3.2, 3.3_
+
+- [ ] 2. Implement settings, secret handling and structured logging
+  - [ ] 2.1 Implement typed settings
+    - Create pydantic models for secrets, AOIs, global HTTP behavior, database pools, run limits, backfills and all source-specific settings.
+    - Load `.env` when present and obtain credentials only from environment variables.
+    - Let environment values override YAML settings.
+    - Validate bounding boxes, schedules, retry limits, pool values, QA thresholds and enabled products at startup.
+    - Treat NCMRWF credentials as optional for the wind job so missing NCMRWF access triggers GFS fallback rather than disabling wind ingestion.
+    - _Requirements: 3.1, 3.4, 3.6, 3.7, 13.2, 13.3_
+  - [ ] 2.2 Implement job-scoped secret validation
+    - Let every source declare its required secrets.
+    - Fail only the selected job when one of its required variables is missing, name the variable and return exit code 2.
+    - Register available secret values with the redaction system without logging them.
+    - _Requirements: 3.4, 3.5_
+  - [ ] 2.3 Implement JSON logging and context propagation
+    - Emit one JSON object per line with timestamp, level, event, source, product, run ID and window.
+    - Carry context through `contextvars` so every component writes correlated logs.
+    - Set httpx and httpcore to warning level to avoid full request URLs at info level.
+    - _Requirements: 2.4, 6.6_
+  - [ ] 2.4 Implement secret redaction
+    - Redact every registered secret from formatted log messages, arguments, tracebacks and database error summaries.
+    - Mask the key segment in every FIRMS URL even if no MAP_KEY was registered.
+    - Validate with harmless canary strings that no secret appears in console output or a stored error summary.
+    - _Requirements: 3.2, 3.5_
+
+- [ ] 3. Build the shared resilient HTTP and download layer
+  - [ ] 3.1 Define the HTTP error taxonomy
+    - Add separate exceptions for retryable HTTP errors, retry exhaustion, non-retryable responses, authentication failure, not-found/not-published responses, transport failures and upstream format failures.
+    - Preserve source, product, status and attempt metadata without including credentials.
+    - _Requirements: 2.1, 2.5, 2.6_
+  - [ ] 3.2 Implement the shared httpx client and tenacity policy
+    - Apply configurable connect, read, write and pool timeouts to every request.
+    - Retry connection errors, timeouts, HTTP 429 and all 5xx responses with exponential backoff and random jitter.
+    - Honor `Retry-After` on 429 and 503, in seconds or HTTP-date format.
+    - Stop at both the configured attempt count and total wait limit.
+    - Log source, product, attempt, failure and wait before every retry.
+    - Treat other 4xx responses as non-retryable.
+    - _Requirements: 1.6, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6_
+  - [ ] 3.3 Implement token refresh support
+    - Define a `TokenProvider` interface for cached access tokens.
+    - On HTTP 401, invalidate or refresh the token and retry exactly once.
+    - Raise a non-retryable authentication error after a second 401.
+    - _Requirements: 2.7_
+  - [ ] 3.4 Implement resilient file downloads
+    - Stream downloads to temporary files and atomically rename them when complete.
+    - Resume partial downloads with byte ranges where supported.
+    - Verify expected MD5 checksums and delete corrupt temporary files.
+    - Route every HTTP interaction through the shared retry layer.
+    - _Requirements: 2.1, 10.1, 11.1_
+  - [ ] 3.5 Implement host rate limiting
+    - Add a configurable token-bucket limiter per upstream host.
+    - Configure conservative limits for Overpass and NOMADS.
+    - Expose a weighted limiter for FIRMS, where a request consumes one token per requested day.
+    - _Requirements: 7.7, 10.6_
+  - [ ] 3.6 Validate HTTP resilience
+    - Exercise the client against a local stub that returns 429 with `Retry-After`, then succeeds.
+    - Exercise 503, timeout, permanent 403 and 401-refresh scenarios.
+    - Confirm waits, maximum attempts, redaction and final exceptions match the design.
+    - _Requirements: 2.1, 2.2, 2.3, 2.5, 2.7_
+
+- [ ] 4. Create the PostGIS schema and migrations
+  - [ ] 4.1 Initialize Alembic for the `ingestion` schema
+    - Keep the Alembic version table inside the ingestion schema.
+    - Create the PostGIS extension and schema safely if they do not exist.
+    - Make every migration safe to re-run after a partially completed deployment.
+    - _Requirements: 5.1, 5.8_
+  - [ ] 4.2 Create lightweight point staging tables
+    - Create `fire_detections`, `geo_detections`, `no2_products`, `no2_pixels`, `wind_grid` and `wind_cycles` exactly as specified in the design.
+    - Use EPSG:4326 generated point geometries, UTC `as_of`, `ingested_at`, natural uniqueness constraints and monthly range partitions for time-series rows.
+    - Add GiST geometry indexes and B-tree time indexes to every applicable partition.
+    - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.9_
+  - [ ] 4.3 Create contextual and coverage tables
+    - Create `optical_scenes`, `osm_loads`, `osm_features`, `land_cover_versions`, `land_cover_tiles` and `land_cover_classes`.
+    - Add `osm_features_current`, spatial indexes and the partial uniqueness constraint for one active OSM load per coverage key.
+    - Enable only the PostGIS raster GDAL driver needed for GeoTIFF ingestion.
+    - _Requirements: 5.1, 10.3, 10.4, 12.2, 14.1, 14.2, 14.4_
+  - [ ] 4.4 Create operational tracking tables
+    - Create `job_runs`, `run_units`, `gaps`, `source_freshness`, `job_leases` and `backfill_chunks` with the statuses and keys from the design.
+    - Add checks or enums that reject unknown run, unit, load and chunk statuses.
+    - _Requirements: 6.1, 6.2, 6.3, 7.5_
+  - [ ] 4.5 Add lookup functions and seed reference data
+    - Add SQL functions or stable repository queries for `wind_at(...)` and `land_cover_at(...)`.
+    - Seed the ESA WorldCover native class code-to-name mapping idempotently.
+    - _Requirements: 13.9, 14.2, 14.3_
+  - [ ] 4.6 Validate migrations
+    - Apply all migrations to a clean database, apply them again, and verify no duplicate objects or errors.
+    - Confirm every geometry has SRID 4326 and a usable spatial index.
+    - Confirm uniqueness constraints reject duplicate natural keys but allow different products or sources side by side.
+    - _Requirements: 5.1, 5.6, 5.7, 5.8_
+
+- [ ] 5. Implement pooled database access and idempotent writes
+  - [ ] 5.1 Build the per-process SQLAlchemy engine factory
+    - Use psycopg 3 with `QueuePool`, configurable `pool_size`, `max_overflow`, `pool_timeout`, pre-ping, recycle and an application name containing the source.
+    - Lazily create and reuse one engine per job process.
+    - _Requirements: 4.1, 4.2_
+  - [ ] 5.2 Enforce the global connection budget
+    - Sum the runner, every enabled job and the allowed concurrent backfills.
+    - Compare the sum with the configured budget and the database's `max_connections`.
+    - Refuse startup with a per-process breakdown when either limit is unsafe.
+    - _Requirements: 4.3_
+  - [ ] 5.3 Implement short batched upserts
+    - COPY each configurable batch into a temporary table, then insert with `ON CONFLICT DO NOTHING`.
+    - Check out a connection only while creating a partition or committing a batch.
+    - Return fetched, inserted and duplicate counts.
+    - _Requirements: 4.4, 4.5, 5.6_
+  - [ ] 5.4 Retry transient database failures
+    - Retry pool timeouts and operational connection errors with bounded exponential backoff.
+    - Retry the complete batch safely through its idempotent key.
+    - Raise a source-local error after exhaustion.
+    - _Requirements: 4.6_
+  - [ ] 5.5 Implement concurrency-safe monthly partition creation
+    - Create missing monthly partitions with `IF NOT EXISTS` under a transaction-scoped advisory lock derived from the table name.
+    - Keep partition locks local to writers of the same table.
+    - _Requirements: 5.8_
+  - [ ] 5.6 Validate database resource behavior
+    - In separate processes, write overlapping batches and verify one copy of each natural key remains.
+    - Observe `pg_stat_activity` and verify no connection remains checked out during simulated network waits.
+    - Lower the configured connection budget and verify `check` refuses to start with a clear allocation report.
+    - _Requirements: 4.2, 4.3, 4.4, 5.6_
+
+- [ ] 6. Implement run tracking, leases and source-independent execution
+  - [ ] 6.1 Add core job models and interfaces
+    - Implement `Window`, `WorkUnit`, `ParseResult`, `StoreStats`, AOI and `SourceJob` from the design.
+    - Enforce inclusive start and exclusive end timestamps in UTC.
+    - Make source adapters register by source name without importing one another.
+    - _Requirements: 1.1, 1.5, 5.2_
+  - [ ] 6.2 Implement run and unit lifecycle tracking
+    - Create and close `job_runs` and `run_units` with counts, retries, statuses and redacted errors.
+    - Derive the final run status from all units exactly as specified in the design.
+    - Treat a covered zero-row result as succeeded.
+    - _Requirements: 6.1, 6.2, 6.4_
+  - [ ] 6.3 Implement gaps and freshness
+    - Upsert failed or unpublished windows into `gaps`, track attempts and resolve a gap after a successful retry.
+    - Append the configured number of oldest unresolved gaps to scheduled work.
+    - Advance source freshness only from successfully stored records and successful runs.
+    - _Requirements: 2.6, 6.3, 6.5_
+  - [ ] 6.4 Implement expiring job leases
+    - Acquire leases atomically, heartbeat them from a short-lived connection and allow abandoned leases to expire.
+    - Skip overlapping scheduled runs of the same source and record the skip.
+    - Keep backfill leases separate from scheduled leases.
+    - _Requirements: 1.7, 4.4, 7.6_
+  - [ ] 6.5 Implement the shared job executor
+    - Validate required secrets, acquire the lease, record the run, and process each product unit inside a separate exception boundary.
+    - Check product coverage before fetching and record `no_coverage` without a request.
+    - Convert exhausted retries, non-retryable failures, format errors, unavailable databases and unexpected errors into source-local unit failures and gaps.
+    - Continue with every other product unit after a failure.
+    - _Requirements: 1.3, 1.5, 1.8, 2.6, 6.1, 9.4_
+
+- [ ] 7. Implement the process-isolated runner and complete CLI
+  - [ ] 7.1 Implement the APScheduler supervisor
+    - Register one independent interval trigger per enabled source with one scheduler worker per job.
+    - Set `max_instances=1`, coalescing and small startup jitter per job.
+    - Validate settings and the connection budget before scheduling.
+    - _Requirements: 1.2, 1.7, 4.3_
+  - [ ] 7.2 Spawn each run as a child process
+    - Execute `python -m ingestion run <source>` with an assigned run ID.
+    - Enforce each job's maximum runtime, terminate timed-out child processes and repair runs left in `running` after crashes.
+    - Keep supervising all remaining jobs regardless of child exit code.
+    - _Requirements: 1.3, 1.4, 1.5_
+  - [ ] 7.3 Complete CLI commands and exit behavior
+    - Wire `runner`, `run`, `backfill`, `migrate` and `check` to their implementations.
+    - Return exit code 0 for completed, partial, skipped and no-coverage runs; 1 for unexpected process failures; and 2 for configuration or secret errors.
+    - Make error output useful without exposing credentials.
+    - _Requirements: 1.1, 3.4, 7.3_
+  - [ ] 7.4 Validate isolation
+    - Run one healthy stub job next to jobs configured to time out, crash and exhaust HTTP retries.
+    - Verify the healthy job keeps running on schedule, every failure is logged and no source waits on another.
+    - _Requirements: 1.2, 1.3, 1.4, 1.5_
+
+- [ ] 8. Implement resumable historical backfills
+  - [ ] 8.1 Build source-aware chunk planning
+    - Hash source, AOI, range and products into a stable backfill ID.
+    - Create non-overlapping chunks that exactly cover the requested range.
+    - Use source limits: FIRMS 5 days, HMS 1 day, TROPOMI 1 day, optical 7 days and wind 1 day.
+    - _Requirements: 7.1, 7.2, 7.3, 7.4_
+  - [ ] 8.2 Persist and resume backfill chunks
+    - Insert planned chunks idempotently.
+    - On rerun, process only pending and failed chunks; never re-fetch done or skipped chunks.
+    - Keep chunk attempts and redacted errors.
+    - _Requirements: 7.5, 7.10_
+  - [ ] 8.3 Run backfills without blocking scheduled jobs
+    - Use a separate process, engine and lease for every active backfill.
+    - Enforce `backfill.max_concurrent` and include it in the connection budget.
+    - _Requirements: 4.3, 7.6_
+  - [ ] 8.4 Add FIRMS availability routing and pacing
+    - Read FIRMS data availability, prefer standard-processing products for historical data, split at product availability boundaries and skip uncovered dates with a log record.
+    - Consume weighted rate-limit tokens by requested day and reserve configured headroom for live polling.
+    - _Requirements: 7.7, 7.8, 7.9_
+  - [ ] 8.5 Validate interruption and resume
+    - Start a multi-chunk backfill, stop it after a completed chunk, then rerun the identical command.
+    - Confirm completed chunks are not fetched again, current scheduled runs continue, and all stored rows use the normal live schema.
+    - _Requirements: 7.5, 7.6, 7.10_
+
+- [ ] 9. Implement NASA FIRMS ingestion
+  - [ ] 9.1 Build FIRMS scheduled and backfill work units
+    - Poll each configured VIIRS and MODIS product for every AOI on the configured schedule.
+    - Use the 2-day trailing window for live runs and 5-day maximum chunks for historical runs.
+    - Generate Area API URLs without ever logging the MAP_KEY.
+    - _Requirements: 7.1, 8.1, 8.5_
+  - [ ] 9.2 Parse VIIRS and MODIS CSV safely
+    - Verify required header columns before accepting the response.
+    - Map VIIRS `bright_ti4` and MODIS `brightness` to `brightness_temp`; preserve FRP, satellite, instrument, confidence, scan, track and version.
+    - Combine `acq_date` and zero-padded HHMM `acq_time` into UTC `as_of`.
+    - Reject and count malformed rows while continuing with valid rows.
+    - Fail the complete product unit for HTML, invalid-key text or an unexpected CSV schema.
+    - _Requirements: 8.2, 8.3, 8.4, 8.6, 8.7_
+  - [ ] 9.3 Store FIRMS rows idempotently
+    - Ensure relevant monthly partitions exist and batch into `fire_detections`.
+    - Preserve NRT and standard-processing products independently.
+    - Update run counts and FIRMS freshness from the maximum stored acquisition time.
+    - _Requirements: 5.6, 5.7, 6.3, 8.1_
+  - [ ] 9.4 Validate live and historical FIRMS paths
+    - Run a small India AOI poll with a valid key and verify parsed field mappings.
+    - Backfill a multi-chunk date range, rerun it, and confirm no duplicates and no repeat downloads for completed chunks.
+    - Temporarily use an invalid endpoint and verify the other jobs continue.
+    - _Requirements: 1.3, 7.1, 7.4, 7.5, 8.2, 8.7_
+
+- [ ] 10. Implement NOAA HMS/GOES ingestion
+  - [ ] 10.1 Define HMS coverage and work units
+    - Configure the default North America coverage polygon and the current-plus-previous-day schedule.
+    - Filter HMS rows to GOES satellites by default so VIIRS and MODIS detections do not duplicate FIRMS.
+    - Produce one backfill unit per archive day.
+    - _Requirements: 9.1, 9.3, 9.6_
+  - [ ] 10.2 Short-circuit out-of-coverage AOIs
+    - Compare the configured AOI with product coverage before constructing or sending a request.
+    - Record India runs as `no_coverage` and leave no gap.
+    - _Requirements: 9.3, 9.4_
+  - [ ] 10.3 Fetch and parse HMS day files
+    - Build date-addressed archive URLs and treat a missing current file as not yet published.
+    - Parse Lon, Lat, YearDay, Time, Satellite, Method, Ecosystem and FRP.
+    - Convert `-999` FRP to null and combine YYYYDDD with HHMM into UTC `as_of`.
+    - _Requirements: 9.2, 9.5, 9.6_
+  - [ ] 10.4 Store normalized geostationary detections
+    - Batch into `geo_detections` with `product='HMS'` and natural-key deduplication.
+    - Keep the adapter interface extensible to later geostationary products without changing the table.
+    - _Requirements: 5.6, 9.7_
+  - [ ] 10.5 Validate expected India behavior
+    - Run the job with the default India AOI and verify it records `no_coverage` without an outbound request.
+    - Run a small North America backfill day and verify GOES rows parse and store.
+    - _Requirements: 9.2, 9.4, 9.6_
+
+- [ ] 11. Implement offline-first OpenStreetMap ingestion
+  - [ ] 11.1 Discover and download configured regional extracts
+    - Read Geofabrik's extract registry or configured URLs.
+    - Default to India zone extracts to bound memory use.
+    - Download `.osm.pbf` plus checksum through the shared client and skip unchanged extract timestamps.
+    - _Requirements: 2.1, 10.1_
+  - [ ] 11.2 Parse only the required OSM context
+    - Use pyrosm custom criteria for industrial land use, works, flares, petroleum wells, power plants, mines, quarries, farmland, farmyards and orchards.
+    - Store OSM type and ID, matched tag key/value, optional name, representative lat/lon, complete geometry and extract `as_of`.
+    - _Requirements: 10.2, 10.3_
+  - [ ] 11.3 Implement atomic extract version swaps
+    - Insert a loading `osm_loads` row, bulk-load all features, then replace the active load in one transaction.
+    - Expose only active data through `osm_features_current`.
+    - Retain one superseded load for rollback and remove older loads in batches.
+    - _Requirements: 10.4_
+  - [ ] 11.4 Implement localized Overpass fallback
+    - Add `features_near(lat, lon, radius_m)` for the features layer.
+    - Query a loaded extract first, then a fresh cached Overpass load.
+    - Only when neither covers the point, request a snapped local bbox no larger than the configured maximum and persist the result as an Overpass load.
+    - Apply the shared retries and a conservative host rate limit; provide no bulk Overpass path.
+    - _Requirements: 2.1, 10.5, 10.6_
+  - [ ] 11.5 Validate OSM completeness and atomicity
+    - Load one manageable India zone and confirm representative points and geometries use EPSG:4326.
+    - Refresh that zone and verify readers see only a complete old or complete new load.
+    - Query outside all extracts and verify exactly one localized Overpass request is cached.
+    - _Requirements: 10.1, 10.3, 10.4, 10.5, 10.6_
+
+- [ ] 12. Implement Sentinel-5P TROPOMI NO2 ingestion
+  - [ ] 12.1 Implement Copernicus Data Space authentication
+    - Use CDSE credentials from the environment with `cdse-public` OAuth authentication.
+    - Cache access tokens until shortly before expiry, use refresh tokens when possible and integrate one-time 401 refresh with the shared HTTP client.
+    - _Requirements: 2.7, 3.1, 11.1_
+  - [ ] 12.2 Search and page through NO2 products
+    - Query CDSE OData for `SENTINEL-5P` `L2__NO2___` products intersecting each AOI and time window.
+    - Follow `@odata.nextLink`, parse NRTI/OFFL/RPRO, orbit and processor version, and skip product names already recorded.
+    - Schedule a daily 3-day lookback and support daily backfill units.
+    - _Requirements: 7.2, 11.1, 11.4_
+  - [ ] 12.3 Download and parse products
+    - Check temporary disk space and stream one product to a temporary file.
+    - Open the netCDF `PRODUCT` group and read latitude, longitude, tropospheric NO2, QA and scanline time.
+    - Keep exactly finite values with QA at or above 0.75 and centers inside the AOI.
+    - Delete the downloaded file after the product row and every accepted pixel commit successfully; clean abandoned temporary files separately.
+    - _Requirements: 11.2, 11.3, 11.5_
+  - [ ] 12.4 Store product provenance and lightweight pixels
+    - Insert `no2_products`, use its key in `no2_pixels`, create needed partitions and batch accepted pixels.
+    - Store later processing streams as separate product rows instead of replacing NRTI rows.
+    - Update NO2 freshness from scanline times.
+    - _Requirements: 5.3, 5.5, 5.7, 6.3, 11.2, 11.4_
+  - [ ] 12.5 Validate one India orbit
+    - Ingest one product intersecting India and verify QA, AOI filtering, units, provenance and cleanup.
+    - Rerun the product and confirm it is skipped without duplicate pixel rows.
+    - _Requirements: 5.6, 11.2, 11.3, 11.5_
+
+- [ ] 13. Implement Sentinel-2 and Landsat optical metadata ingestion
+  - [ ] 13.1 Build a shared paginated STAC search client
+    - Send POST searches through the resilient HTTP client and follow relation-based next links.
+    - Keep endpoints and collection IDs configurable.
+    - _Requirements: 2.1, 12.1_
+  - [ ] 13.2 Configure Sentinel-2 and Landsat searches
+    - Search CDSE for Sentinel-2 L2A scenes.
+    - Search USGS LandsatLook for Landsat 8/9 Collection 2 Level-2 surface reflectance scenes.
+    - Intersect each query with the AOI and support a 5-day scheduled lookback plus 7-day backfill chunks.
+    - _Requirements: 7.2, 12.1_
+  - [ ] 13.3 Normalize and store scene metadata
+    - Map scene ID, platform, sensing time, footprint, `eo:cloud_cover`, processing level, MGRS tile or WRS path/row and STAC item URL.
+    - Store missing or negative cloud-cover values as null and log them.
+    - Download no scene pixels.
+    - Upsert by scene ID and update per-platform freshness.
+    - _Requirements: 5.6, 6.3, 12.2, 12.3, 12.4_
+  - [ ] 13.4 Validate both providers
+    - Ingest one Sentinel-2 page and one Landsat page for India.
+    - Verify cloud cover stays between 0 and 100 or null, footprints use EPSG:4326, and no image asset was downloaded.
+    - _Requirements: 12.1, 12.2, 12.3, 12.4_
+
+- [ ] 14. Implement wind ingestion with NCMRWF-to-GFS routing
+  - [ ] 14.1 Implement GRIB/NetCDF decoding and wind conversion
+    - Decode 10 m U and V components through xarray/cfgrib or xarray/netCDF.
+    - Crop to the AOI, apply configured grid stride and calculate speed and meteorological from-direction.
+    - Validate finite values, nonnegative speed and direction in `[0, 360)`.
+    - _Requirements: 13.1, 13.6, 13.7_
+  - [ ] 14.2 Implement recent GFS ingestion through NOMADS
+    - Discover 00, 06, 12 and 18 UTC cycles and configured lead times.
+    - Request only UGRD/VGRD at 10 m and the configured bbox through the GFS 0.25° grib filter.
+    - Apply host pacing, shared retries and current-window gap handling.
+    - _Requirements: 2.1, 13.4, 13.6_
+  - [ ] 14.3 Implement historical GFS archive access
+    - Read the NODD/AWS `.idx` inventory and request only matching byte ranges for 10 m U/V messages.
+    - Make archive URL templates version-aware and configurable.
+    - Route backfills older than the NOMADS window to this adapter automatically.
+    - _Requirements: 7.2, 13.8_
+  - [ ] 14.4 Implement the configurable NCMRWF adapter
+    - Support configured URL templates, basic or token authentication, GRIB2 or NetCDF, cycles, leads and coverage.
+    - Fetch the NCUM-R 4 km regional product when credentials and endpoints are available.
+    - Mark each cycle unavailable with a reason when credentials are absent, authentication or retried requests fail, or publication exceeds the configured wait.
+    - _Requirements: 2.1, 3.1, 13.1, 13.3_
+  - [ ] 14.5 Implement automatic source routing and persistence
+    - Always store GFS for the AOI and store NCMRWF alongside it where available.
+    - On any NCMRWF-unavailable condition, finish GFS ingestion and mark stored rows with `source='GFS'`.
+    - Keep `source`, reference time, lead time and valid time in every row and never overwrite one source with another.
+    - Reject any HRRR source in configuration.
+    - _Requirements: 5.7, 13.2, 13.3, 13.4, 13.5, 13.6_
+  - [ ] 14.6 Finish and validate `wind_at`
+    - Prefer NCMRWF only within its spatial/time tolerances; otherwise return GFS.
+    - Prefer the shortest forecast lead and respect optional `known_at` for causal replay.
+    - Return speed, direction, selected source and valid `as_of`.
+    - Verify an unavailable NCMRWF setup over India returns GFS rather than failing the wind job.
+    - _Requirements: 13.2, 13.9_
+
+- [ ] 15. Implement land-cover ingestion and lookup
+  - [ ] 15.1 Configure ESA WorldCover
+    - Define WorldCover 2021 v200 COG URL construction, source-tile coverage, reference year, target cell size and class map.
+    - Determine all 3° source tiles intersecting the AOI and treat missing ocean tiles as expected.
+    - _Requirements: 14.1, 14.2_
+  - [ ] 15.2 Resample and store PostGIS raster tiles
+    - Read COG windows or overviews with rasterio/GDAL and retry transient remote-read failures with exponential backoff.
+    - Resample categorically using majority mode to the configured resolution.
+    - Write 240×240 one-band raster tiles with SRID 4326 and nodata 0.
+    - Keep each dataset version in a separate loading/ready version record.
+    - _Requirements: 2.1, 5.1, 14.1, 14.4_
+  - [ ] 15.3 Finish and validate `land_cover_at`
+    - Select the requested version, or latest ready version, and use `ST_Value` on the intersecting raster tile.
+    - Return native class code, readable class name and version `as_of`.
+    - Run the source on demand, leaving its periodic schedule disabled unless configured.
+    - Verify representative India points return expected class names and that a second version can coexist.
+    - _Requirements: 14.2, 14.3, 14.4, 14.5_
+
+- [ ] 16. Complete operational acceptance verification and runbooks
+  - [ ] 16.1 Verify external-failure isolation
+    - Run all enabled jobs with one upstream intentionally set to an unreachable local address.
+    - Confirm retries and a redacted failure are recorded for that source while other jobs finish unaffected.
+    - Confirm the runner remains alive and schedules the next run.
+    - _Requirements: 1.2, 1.3, 1.4, 2.6_
+  - [ ] 16.2 Verify NCMRWF fallback acceptance
+    - Leave NCMRWF credentials absent or point its adapter to an unavailable endpoint.
+    - Confirm the wind run finishes using GFS, `wind_cycles` records the fallback reason and queried records report `source='GFS'`.
+    - _Requirements: 13.2, 13.3, 13.4_
+  - [ ] 16.3 Verify arbitrary FIRMS backfill acceptance
+    - Backfill a date range spanning multiple five-day chunks and, if available, a standard/NRT product boundary.
+    - Interrupt and resume the run, then repeat it once more.
+    - Confirm exact range coverage, skipped unsupported dates, no duplicates, no repeated completed chunks and uninterrupted scheduled polling.
+    - _Requirements: 7.1, 7.4, 7.5, 7.6, 7.8, 7.9, 7.10_
+  - [ ] 16.4 Verify freshness, causal timestamps and data-contract mapping
+    - Inspect each source table for UTC `as_of`, `ingested_at`, provenance and natural keys.
+    - Confirm `source_freshness` advances only after successful storage.
+    - Confirm every ingestion field needed by `data-contracts.md` can be obtained using the mapping in `design.md` without consulting future records.
+    - _Requirements: 5.2, 5.3, 5.4, 5.5, 6.3_
+  - [ ] 16.5 Verify the connection limit under parallel load
+    - Run all enabled jobs plus the configured number of backfills concurrently.
+    - Confirm observed database sessions remain under the budget, pool acquisition failures affect only their own runs and no connection is held during remote waits.
+    - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.6_
+  - [ ] 16.6 Write the ingestion operations runbook
+    - Document environment setup, migrations, schedules, one-off runs, backfills, resume behavior, gap inspection, freshness queries, source credentials and common failures.
+    - Document that HMS returns `no_coverage` for the default India AOI and that GFS is the expected wind source until NCMRWF access is configured.
+    - Include copy-paste Windows PowerShell and Docker commands without real secrets.
+    - _Requirements: 1.1, 3.2, 7.3, 9.4, 13.2_
+
+## Requirement Traceability
+
+| Requirement | Implemented by tasks |
+|---|---|
+| 1. Independent job execution | 1, 6, 7, 16.1 |
+| 2. Exponential backoff | 3, all source adapter tasks, 16.1 |
+| 3. Secrets and configuration | 1.3, 2, 16.6 |
+| 4. Database connection management | 1.4, 5, 8.3, 16.5 |
+| 5. Shared store and contract alignment | 4, 5, all source store tasks, 16.4 |
+| 6. Run tracking and freshness | 2.3, 4.4, 6, all source store tasks, 16.4 |
+| 7. Historical backfill | 8, source-specific backfill tasks, 16.3 |
+| 8. NASA FIRMS | 9 |
+| 9. NOAA HMS / GOES | 10 |
+| 10. OpenStreetMap | 11 |
+| 11. Sentinel-5P TROPOMI | 12 |
+| 12. Sentinel-2 / Landsat | 13 |
+| 13. NCMRWF / GFS wind | 14, 16.2 |
+| 14. Land cover | 15 |

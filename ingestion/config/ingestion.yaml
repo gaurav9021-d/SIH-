@@ -1,0 +1,39 @@
+aois:
+  india: [68.0, 6.5, 97.5, 37.5]
+default_aoi: india
+
+http:
+  connect_timeout_s: 10.0
+  read_timeout_s: 60.0
+  write_timeout_s: 60.0
+  pool_timeout_s: 10.0
+  max_attempts: 6
+  max_total_wait_s: 900.0
+  backoff_initial_s: 2.0
+  backoff_max_s: 120.0
+  user_agent: "SIH26162-ingestion/0.1 (+https://github.com/gaurav9021-d/SIH-)"
+
+database:
+  pool_size: 2
+  max_overflow: 1
+  pool_timeout_s: 30.0
+  pool_recycle_s: 1800
+  batch_size: 5000
+  operation_max_attempts: 4
+  connection_budget: 40
+
+firms:
+  base_url: "https://firms.modaps.eosdis.nasa.gov/api"
+  chunk_days: 5
+  product_families:
+    VIIRS_SNPP: [VIIRS_SNPP_SP, VIIRS_SNPP_NRT]
+    VIIRS_NOAA20: [VIIRS_NOAA20_SP, VIIRS_NOAA20_NRT]
+    VIIRS_NOAA21: [VIIRS_NOAA21_NRT]
+    MODIS: [MODIS_SP, MODIS_NRT]
+  backfill:
+    transactions_per_10_minutes: 3000
+    map_key_limit_per_10_minutes: 5000
+    reserve_for_live_polling: 2000
+    max_concurrent: 2
+    lease_ttl_s: 120
+    lease_heartbeat_s: 30
